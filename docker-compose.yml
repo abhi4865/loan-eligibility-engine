@@ -66,6 +66,9 @@ services:
       TZ: Asia/Kolkata
       # values our workflows will read later (phases 3 to 5)
       N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET}
+      # Optional; Workflow B skips LLM calls safely when no key is configured.
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
       MAX_DEMO_EMAILS: ${MAX_DEMO_EMAILS:-5}
       TEST_EMAIL_1: ${TEST_EMAIL_1}
       TEST_EMAIL_2: ${TEST_EMAIL_2}

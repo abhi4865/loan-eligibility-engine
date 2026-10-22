@@ -1,0 +1,306 @@
+{
+  "name": "A - Loan Product Discovery",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "243b33f0-d171-43ee-b78e-1b4054d584b9"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 2
+            }
+          ]
+        }
+      },
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        208
+      ],
+      "id": "db6805d6-d7a5-4f97-9f96-22bea6d2791c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config sources: the list of lender pages to crawl.\n// Why: one place to add or change sites. Each item becomes one HTTP request.\n// To use a real site, change the url (static HTML pages only).\nconst sources = [\n  { provider: 'QuickCredit Bank', url: 'http://host.docker.internal:8080/bank_a.html' },\n  { provider: 'FinEasy Lenders',  url: 'http://host.docker.internal:8080/bank_b.html' },\n];\nreturn sources.map(s => ({ json: s }));\n"
+      },
+      "name": "Config sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        112
+      ],
+      "id": "4ed52871-4ed5-4cc3-98cf-32dd7282d527"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "name": "Fetch page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        112
+      ],
+      "id": "dbe4b5bf-fd50-436e-a978-06b500330afc",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "extractHtmlContent",
+        "extractionValues": {
+          "values": [
+            {
+              "key": "names",
+              "cssSelector": ".loan-name",
+              "returnArray": true
+            },
+            {
+              "key": "rates",
+              "cssSelector": ".loan-rate",
+              "returnArray": true
+            },
+            {
+              "key": "rules",
+              "cssSelector": ".loan-rules",
+              "returnArray": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Extract HTML",
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        112
+      ],
+      "id": "ed690585-b4d4-41cf-8b58-713a5f183f01",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize: turns the extracted text arrays into ONE SQL upsert statement.\n// Why: one DB call is faster, and the SQL keeps old values if a field cannot be parsed.\nconst cfg = $('Config sources').all();   // same order as the HTTP results\nconst pages = $input.all();              // one item per site (arrays: names, rates, rules)\n\n// Small helpers. They make values safe to put inside SQL text.\nconst asArr = v => Array.isArray(v) ? v : (v ? [v] : []);\nconst q = s => (s === null || s === undefined || s === '') ? 'NULL' : \"'\" + String(s).replace(/'/g, \"''\") + \"'\";\nconst n = v => (v === null || v === undefined || isNaN(v)) ? 'NULL' : String(Number(v));\nconst toNum = t => Number(String(t).replace(/,/g, ''));\nconst arr = a => a.length ? 'ARRAY[' + a.map(q).join(',') + ']::text[]' : 'NULL::text[]';\n\n// Reads the rule text and pulls out numbers we can store in columns.\n// Anything we cannot read stays null (the LLM stage reads the raw text later).\nfunction parseRule(text) {\n  const r = text || '';\n  const inc = r.match(/income[^0-9]{0,30}([0-9][0-9,]*)/i);\n  const sc2 = r.match(/score[^0-9]{0,15}([0-9]{3})\\s*(?:to|-|and)\\s*([0-9]{3})/i);\n  const sc1 = r.match(/score[^0-9]{0,15}([0-9]{3})/i);\n  const ag2 = r.match(/\\bage\\b[^0-9]{0,15}([0-9]{2})\\s*(?:to|-|and)\\s*([0-9]{2})/i);\n  const ag1 = r.match(/\\bage\\b[^0-9]{0,15}([0-9]{2})/i);\n  const low = r.toLowerCase();\n  const emp = [];\n  if (low.includes('salaried')) emp.push('salaried');\n  if (/self[- ]employed/.test(low)) emp.push('self-employed');\n  if (low.includes('business')) emp.push('business');\n  return {\n    minIncome: inc ? toNum(inc[1]) : null,\n    minScore: sc2 ? Number(sc2[1]) : (sc1 ? Number(sc1[1]) : null),\n    maxScore: sc2 ? Number(sc2[2]) : null,\n    minAge: ag2 ? Number(ag2[1]) : (ag1 ? Number(ag1[1]) : null),\n    maxAge: ag2 ? Number(ag2[2]) : null,\n    employment: emp,\n  };\n}\n\nconst rows = new Map();   // key = provider|name, so one statement never repeats a row\nconst counts = {};\npages.forEach((page, i) => {\n  const provider = cfg[i].json.provider;\n  const url = cfg[i].json.url;\n  const names = asArr(page.json.names);\n  const rates = asArr(page.json.rates);\n  const rules = asArr(page.json.rules);\n  counts[provider] = 0;\n  names.forEach((name, j) => {\n    const nm = String(name).trim();\n    if (!nm) return;\n    const text = String(rules[j] || '').replace(/\\s+/g, ' ').trim();\n    const rate = String(rates[j] || '').match(/([0-9]+(?:\\.[0-9]+)?)\\s*%/);\n    rows.set(provider + '|' + nm, { provider, nm, url, text, rate: rate ? Number(rate[1]) : null, ...parseRule(text) });\n    counts[provider] += 1;\n  });\n});\n\nconst emptySites = Object.keys(counts).filter(k => counts[k] === 0);\nconst values = [...rows.values()].map(r =>\n  `(${q(r.provider)},${q(r.nm)},${q(r.url)},${n(r.rate)},${n(r.minIncome)},${n(r.minScore)},${n(r.maxScore)},${n(r.minAge)},${n(r.maxAge)},${arr(r.employment)},${q(r.text)},${r.text ? 'md5(' + q(r.text) + ')' : 'NULL'},now())`\n);\n\n// With no rows we send a harmless query that returns nothing.\nconst sql = values.length === 0 ? 'SELECT 1 AS product_id WHERE false' :\n`INSERT INTO loan_products (provider, product_name, source_url, interest_rate, min_monthly_income, min_credit_score, max_credit_score, min_age, max_age, allowed_employment, eligibility_text, raw_hash, last_seen_at)\nVALUES\n${values.join(',\\n')}\nON CONFLICT (provider, product_name) DO UPDATE SET\n  source_url = EXCLUDED.source_url,\n  interest_rate = COALESCE(EXCLUDED.interest_rate, loan_products.interest_rate),\n  min_monthly_income = COALESCE(EXCLUDED.min_monthly_income, loan_products.min_monthly_income),\n  min_credit_score = COALESCE(EXCLUDED.min_credit_score, loan_products.min_credit_score),\n  max_credit_score = COALESCE(EXCLUDED.max_credit_score, loan_products.max_credit_score),\n  min_age = COALESCE(EXCLUDED.min_age, loan_products.min_age),\n  max_age = COALESCE(EXCLUDED.max_age, loan_products.max_age),\n  allowed_employment = COALESCE(EXCLUDED.allowed_employment, loan_products.allowed_employment),\n  eligibility_text = COALESCE(EXCLUDED.eligibility_text, loan_products.eligibility_text),\n  raw_hash = COALESCE(EXCLUDED.raw_hash, loan_products.raw_hash),\n  last_seen_at = now()\nRETURNING product_id, provider, product_name`;\n\nreturn [{ json: { sql, total: rows.size, per_site: counts, empty_sites: emptySites } }];\n"
+      },
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        112
+      ],
+      "id": "69ac2fc6-1d92-4fa4-9207-753d006a92f9"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $json.sql }}",
+        "options": {}
+      },
+      "name": "Upsert loan_products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1200,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "eec34442-2564-40ea-91ba-e461c6b3eb33",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Summary: counts the rows the database confirmed. Good to show in the demo.\nconst done = $input.all().filter(i => i.json.product_id);\nreturn [{ json: { products_upserted: done.length, products: done.map(i => i.json.provider + ' - ' + i.json.product_name) } }];\n"
+      },
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        0
+      ],
+      "id": "76365965-277e-4819-9653-5e6e159f8a85"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "empty-sites",
+              "leftValue": "={{ $json.empty_sites.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Any site empty?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        224
+      ],
+      "id": "354fa444-51be-44a6-b3e9-6f1ead38e72e"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log empty sites: writes a clear warning for every site that gave 0 products.\n// Why: the workflow must not fail, but the developer should still see the problem.\nconst sites = $json.empty_sites;\nsites.forEach(s => console.log('WARNING: 0 products from site ' + s));\nreturn [{ json: { warning: sites.map(s => '0 products from site ' + s), sites } }];\n"
+      },
+      "name": "Log empty sites",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        208
+      ],
+      "id": "81a1eefb-d1d3-4ec4-8fd0-3273dc93d8c5"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "Config sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config sources": {
+      "main": [
+        [
+          {
+            "node": "Fetch page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch page": {
+      "main": [
+        [
+          {
+            "node": "Extract HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract HTML": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Upsert loan_products",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Any site empty?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert loan_products": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any site empty?": {
+      "main": [
+        [
+          {
+            "node": "Log empty sites",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "b2b13ea1-d0db-463c-97ed-fea75d4bd99f",
+  "meta": {
+    "instanceId": "0ebb4105446bec5bd41ebeb2a71f92e4f978bc012067027e7a2a881c3d070432"
+  },
+  "nodeGroups": [],
+  "id": "BifqHXcuQQhhleH0",
+  "tags": []
+}

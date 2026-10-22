@@ -1,0 +1,589 @@
+{
+  "name": "B - User Loan Matching",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "users-processed",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        80
+      ],
+      "webhookId": "7c1b8e2a-4d55-4f0e-9a63-2b1f0c9d1e11",
+      "id": "a0b6cc62-8c21-48f6-bc72-7a101e7c19ac"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "secret-ok",
+              "leftValue": "={{ !!$env.N8N_WEBHOOK_SECRET && $json.headers['x-webhook-secret'] === $env.N8N_WEBHOOK_SECRET }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Check secret",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        224,
+        80
+      ],
+      "id": "84252bdd-a217-4fdb-8c35-f358059cea9a"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"error\":\"unauthorized\"}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        240
+      ],
+      "id": "8ac980a3-3b0c-4b16-a7e7-2330d6c37687"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\":\"accepted\"}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "name": "Respond 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        0
+      ],
+      "id": "167faa23-b4cf-4a87-aec7-05b0c19f5413"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Settings: ONE place for all numbers and rules of Workflow B.\n// Why: Stage 2 and Stage 3 rules are easy to tune here. It also reads and checks batch_id.\nconst body = $('Webhook').first().json.body || {};\nconst batchId = String(body.batch_id || '');\nif (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(batchId)) {\n  throw new Error('batch_id is missing or not a UUID');\n}\n\nconst cfg = {\n  loanAmount: 300000,        // standard loan amount used for the EMI check (rupees)\n  tenureMonths: 36,          // fixed 3 year tenure\n  maxEmiShare: 0.40,         // EMI must be at most 40% of monthly income\n  rateBrackets: [{ maxRate: 10, minIncome: 40000 }],  // low-rate loans need a higher income\n  nearPct: 1.05,             // \"borderline\" = within 5% above a threshold\n  llmMaxPairs: 100,          // max NEW pairs sent to the LLM per run (keeps demo cheap)\n  llmBatchSize: 20,          // users per LLM call\n  llmUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',\n  hiddenCriteria: '(years? old|years? of|experience|tax|itr|turnover|vintage|existing|resident|employer|bank statement)',\n};\n\nconst A = Number(cfg.loanAmount), N = Number(cfg.tenureMonths);\nconst emi = `CASE WHEN p.interest_rate IS NULL THEN NULL\n  WHEN p.interest_rate = 0 THEN ${A}::numeric / ${N}\n  ELSE ${A}::numeric * (p.interest_rate/1200) * power(1 + p.interest_rate/1200, ${N}) / (power(1 + p.interest_rate/1200, ${N}) - 1) END`;\nconst brackets = cfg.rateBrackets\n  .map(b => `(p.interest_rate <= ${Number(b.maxRate)} AND u.monthly_income < ${Number(b.minIncome)})`).join(' OR ') || 'false';\n\n// Stage 2 SQL: delete pairs that fail the rules, mark the rest as 'rules', record after_rules.\nconst sqlRules = `WITH calc AS (\n  SELECT m.match_id, u.monthly_income, ${emi} AS emi, coalesce(${brackets}, false) AS low_rate_fail\n  FROM matches m\n  JOIN users u ON u.user_id = m.user_id\n  JOIN loan_products p ON p.product_id = m.product_id\n  WHERE m.batch_id = $1::uuid\n), bad AS (\n  SELECT match_id FROM calc WHERE (emi IS NOT NULL AND emi > ${Number(cfg.maxEmiShare)} * monthly_income) OR low_rate_fail\n), del AS (\n  DELETE FROM matches WHERE match_id IN (SELECT match_id FROM bad) RETURNING match_id\n), upd AS (\n  UPDATE matches SET stage = 'rules' WHERE batch_id = $1::uuid AND match_id NOT IN (SELECT match_id FROM bad) RETURNING match_id\n)\nINSERT INTO pipeline_stats (batch_id, stage, pairs)\nSELECT $1::uuid, 'after_rules', (SELECT count(*) FROM upd) RETURNING stage, pairs`;\n\n// Stage 3 SQL: find borderline pairs, with any cached LLM answer. New pairs are capped.\nconst key = `md5(coalesce(p.raw_hash,'') || '|' || u.monthly_income::text || '|' || u.credit_score::text || '|' || u.age::text || '|' || lower(u.employment_status))`;\nconst sqlBorderline = `WITH b AS (\n  SELECT m.user_id, m.product_id, p.product_name, p.raw_hash, p.eligibility_text,\n         u.monthly_income, u.credit_score, u.age, lower(u.employment_status) AS employment,\n         coalesce(p.eligibility_text ~* '${cfg.hiddenCriteria}', false) AS hidden_rule,\n         ${key} AS cache_key\n  FROM matches m\n  JOIN users u ON u.user_id = m.user_id\n  JOIN loan_products p ON p.product_id = m.product_id\n  WHERE m.batch_id = $1::uuid\n    AND ( coalesce(p.eligibility_text ~* '${cfg.hiddenCriteria}', false)\n       OR (coalesce(p.min_monthly_income, 0) > 0 AND u.monthly_income < p.min_monthly_income * ${Number(cfg.nearPct)})\n       OR (p.min_credit_score IS NOT NULL AND u.credit_score < p.min_credit_score * ${Number(cfg.nearPct)}) )\n), x AS (\n  SELECT b.*, c.result AS cached,\n         row_number() OVER (PARTITION BY (c.result IS NULL) ORDER BY b.hidden_rule DESC, b.product_id, b.user_id) AS rn\n  FROM b LEFT JOIN llm_cache c ON c.rule_hash = b.cache_key\n)\nSELECT * FROM x WHERE cached IS NOT NULL OR rn <= ${Number(cfg.llmMaxPairs)}`;\n\nreturn [{ json: { batch_id: batchId, sql_rules: sqlRules, sql_borderline: sqlBorderline,\n                  llm_url: cfg.llmUrl, batch_size: cfg.llmBatchSize } }];\n"
+      },
+      "name": "Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "id": "a5fe88a6-a4a1-4b5f-a95b-f8a563af9c98"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO pipeline_stats (batch_id, stage, pairs)\nSELECT $1::uuid, 'all_pairs',\n  ((SELECT count(*) FROM users WHERE batch_id = $1::uuid) * (SELECT count(*) FROM loan_products))::int\nRETURNING stage, pairs",
+        "options": {
+          "queryReplacement": "={{ $('Settings').first().json.batch_id }}"
+        }
+      },
+      "name": "Stage 0 - all pairs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "b48feaa5-fcd8-467a-b3db-8e5dc278acc7",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO matches (user_id, product_id, batch_id, stage)\n  SELECT u.user_id, p.product_id, u.batch_id, 'sql'\n  FROM users u\n  JOIN loan_products p\n    ON u.monthly_income >= COALESCE(p.min_monthly_income, 0)\n   AND u.credit_score  >= COALESCE(p.min_credit_score, 0)\n   AND u.credit_score  <= COALESCE(p.max_credit_score, 900)\n   AND u.age BETWEEN COALESCE(p.min_age, 18) AND COALESCE(p.max_age, 100)\n   AND (p.allowed_employment IS NULL OR lower(u.employment_status) = ANY(p.allowed_employment))\n  WHERE u.batch_id = $1::uuid\n  ON CONFLICT (user_id, product_id) DO UPDATE SET batch_id = EXCLUDED.batch_id, stage = 'sql'\n  RETURNING user_id, product_id\n)\nINSERT INTO pipeline_stats (batch_id, stage, pairs)\nSELECT $1::uuid, 'after_sql', count(*) FROM ins RETURNING stage, pairs",
+        "options": {
+          "queryReplacement": "={{ $('Settings').first().json.batch_id }}"
+        }
+      },
+      "name": "Stage 1 - SQL filter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1104,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "511953b5-69e6-4b47-a5e3-f93573634ac8",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $('Settings').first().json.sql_rules }}",
+        "options": {
+          "queryReplacement": "={{ $('Settings').first().json.batch_id }}"
+        }
+      },
+      "name": "Stage 2 - rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1328,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "fea2dab7-ba37-4ad0-9b82-50579732f7ad",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $('Settings').first().json.sql_borderline }}",
+        "options": {
+          "queryReplacement": "={{ $('Settings').first().json.batch_id }}"
+        }
+      },
+      "name": "Find borderline",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1552,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "18367e71-1ff4-4c56-b53b-c497f4d7961c",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group borderline applicants by rule hash and send at most 20 per request.\n// Without an API key, safely skip new judgments; undecided pairs remain matched.\nconst s = $('Settings').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r.user_id);\nconst fresh = rows.filter(r => !r.cached);\nconst apiKey = String($env.LLM_API_KEY || '').trim();\nif (!apiKey) return [{ json: { dummy: true, skipReason: 'LLM_API_KEY is not configured' } }];\n\nconst byRule = new Map();\nfresh.forEach(r => {\n  const ruleKey = r.raw_hash || ('product:' + r.product_id);\n  if (!byRule.has(ruleKey)) byRule.set(ruleKey, []);\n  byRule.get(ruleKey).push(r);\n});\n\nconst system = `You check loan eligibility. You get one loan product's eligibility text and a list of applicants.\nDecide for each applicant if they meet ALL criteria in the text, using ONLY the applicant fields given.\nIf a criterion needs data that is not in the fields (for example business age), assume it is met.\nReply with JSON only, in exactly this shape: {\"results\":[{\"user_id\":\"...\",\"eligible\":true}]}\nInclude every applicant exactly once. No other text.`;\n\nconst out = [];\nfor (const [ruleKey, list] of byRule) {\n  for (let i = 0; i < list.length; i += s.batch_size) {\n    const chunk = list.slice(i, i + s.batch_size);\n    const keys = {};\n    chunk.forEach(r => { keys[r.user_id] = r.cache_key; });\n    const users = chunk.map(r => ({ user_id: r.user_id, monthly_income: Number(r.monthly_income),\n      credit_score: Number(r.credit_score), age: Number(r.age), employment_status: r.employment }));\n    const user = `Eligibility text: ${chunk[0].eligibility_text}\\nApplicants: ${JSON.stringify(users)}`;\n    out.push({ json: { llm_url: s.llm_url, rule_hash: ruleKey, keys,\n      body: { model: $env.LLM_MODEL, temperature: 0, response_format: { type: 'json_object' },\n              messages: [{ role: 'system', content: system }, { role: 'user', content: user }] } } });\n  }\n}\nif (out.length === 0) out.push({ json: { dummy: true, skipReason: 'No uncached borderline pairs' } });\nreturn out;"
+      },
+      "name": "Plan LLM batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        0
+      ],
+      "id": "3f880b9a-3534-4995-a649-2b10f9b4b1b1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "no-work",
+              "leftValue": "={{ $json.dummy === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Nothing to ask?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        0
+      ],
+      "id": "a0962e74-a7c5-4a83-9fed-4cb785bc952d"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.llm_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.LLM_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "name": "Call LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2208,
+        80
+      ],
+      "id": "66904517-e0bd-4eda-88b8-7887e6eb34cf",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse LLM answers: joins cached answers and new answers, then builds the SQL for\n// (1) saving new answers in llm_cache, (2) deleting rejected pairs, (3) the stats rows.\n// Why safe: bad JSON or a failed call is skipped. Undecided pairs stay (benefit of the doubt) and are not cached.\nconst rows = $('Find borderline').all().map(i => i.json).filter(r => r.user_id);\nconst plan = $('Plan LLM batches').all().map(i => i.json);\nconst answers = $input.all();\nconst q = s => \"'\" + String(s).replace(/'/g, \"''\") + \"'\";\n\nconst decided = new Map();   // cache_key -> true/false\nrows.forEach(r => { if (r.cached && typeof r.cached.eligible === 'boolean') decided.set(r.cache_key, r.cached.eligible); });\n\nconst fresh = new Map();\nlet calls = 0, failed = 0;\nif (!(plan.length === 1 && plan[0].dummy)) {\n  answers.forEach((a, i) => {\n    try {\n      const text = String(a.json.choices[0].message.content).replace(/```json|```/g, '').trim();\n      const data = JSON.parse(text);\n      (Array.isArray(data.results) ? data.results : []).forEach(r => {\n        const key = plan[i].keys[String(r.user_id)];\n        if (key && typeof r.eligible === 'boolean') fresh.set(key, r.eligible);\n      });\n      calls += 1;\n    } catch (e) { failed += 1; }\n  });\n}\nfresh.forEach((v, k) => decided.set(k, v));\n\nconst rejected = [], accepted = [];\nrows.forEach(r => {\n  if (!decided.has(r.cache_key)) return;\n  (decided.get(r.cache_key) ? accepted : rejected).push(`(${q(r.user_id)},${Number(r.product_id)})`);\n});\n\nconst sqlCache = fresh.size === 0 ? 'SELECT 1 WHERE false' :\n  'INSERT INTO llm_cache (rule_hash, result) VALUES ' +\n  [...fresh].map(([k, v]) => `(${q(k)},'{\"eligible\":${v}}'::jsonb)`).join(',') +\n  ' ON CONFLICT (rule_hash) DO NOTHING';\n\nconst delPart = rejected.length ? `WITH del AS (DELETE FROM matches WHERE batch_id = $1::uuid AND (user_id, product_id) IN (VALUES ${rejected.join(',')}) RETURNING 1) ` : '';\nconst updPart = accepted.length ? `UPDATE matches SET stage = 'llm' WHERE batch_id = $1::uuid AND (user_id, product_id) IN (VALUES ${accepted.join(',')})` : '';\nconst sqlApply = (delPart || updPart) ? (delPart + (updPart || 'SELECT count(*) FROM del')) : 'SELECT 1 WHERE false';\n\nconst sqlStats = `WITH c AS (INSERT INTO pipeline_stats (batch_id, stage, pairs) VALUES ($1::uuid, 'llm_calls', ${calls}) RETURNING 1)\nINSERT INTO pipeline_stats (batch_id, stage, pairs)\nSELECT $1::uuid, 'final', count(*) FROM matches WHERE batch_id = $1::uuid RETURNING stage, pairs`;\n\nreturn [{ json: { sql_cache: sqlCache, sql_apply: sqlApply, sql_stats: sqlStats, llm_calls: calls, failed_calls: failed,\n  borderline_seen: rows.length, judged_eligible: accepted.length, judged_rejected: rejected.length } }];\n"
+      },
+      "name": "Parse LLM answers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2432,
+        0
+      ],
+      "id": "4349ebe9-27df-407b-b955-c9a1860e79b2"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $json.sql_cache }}",
+        "options": {}
+      },
+      "name": "Save llm_cache",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2640,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "b3edd9ca-43c7-4208-bdd7-8450ba17bd5e",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $('Parse LLM answers').first().json.sql_apply }}",
+        "options": {
+          "queryReplacement": "={{ $('Settings').first().json.batch_id }}"
+        }
+      },
+      "name": "Apply LLM decisions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2864,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "d5932550-bc6d-4922-89d4-e6a47088437c",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $('Parse LLM answers').first().json.sql_stats }}",
+        "options": {
+          "queryReplacement": "={{ $('Settings').first().json.batch_id }}"
+        }
+      },
+      "name": "Record llm_calls and final",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3088,
+        0
+      ],
+      "alwaysOutputData": true,
+      "id": "3962da8a-3c16-477c-810a-7a37ef7febb4",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/matching-complete",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Webhook-Secret",
+              "value": "={{ $env.N8N_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch_id: $('Settings').first().json.batch_id }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "name": "Trigger Workflow C",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3312,
+        0
+      ],
+      "id": "006b5c16-2a9e-40d5-9b02-add08f84600e",
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Check secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check secret": {
+      "main": [
+        [
+          {
+            "node": "Respond 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Stage 0 - all pairs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 0 - all pairs": {
+      "main": [
+        [
+          {
+            "node": "Stage 1 - SQL filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 1 - SQL filter": {
+      "main": [
+        [
+          {
+            "node": "Stage 2 - rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 2 - rules": {
+      "main": [
+        [
+          {
+            "node": "Find borderline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find borderline": {
+      "main": [
+        [
+          {
+            "node": "Plan LLM batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan LLM batches": {
+      "main": [
+        [
+          {
+            "node": "Nothing to ask?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nothing to ask?": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM answers",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Call LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM answers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM answers": {
+      "main": [
+        [
+          {
+            "node": "Save llm_cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save llm_cache": {
+      "main": [
+        [
+          {
+            "node": "Apply LLM decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply LLM decisions": {
+      "main": [
+        [
+          {
+            "node": "Record llm_calls and final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record llm_calls and final": {
+      "main": [
+        [
+          {
+            "node": "Trigger Workflow C",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "e595405b-46c6-4c15-8f04-1ee6e2d84138",
+  "meta": {
+    "instanceId": "0ebb4105446bec5bd41ebeb2a71f92e4f978bc012067027e7a2a881c3d070432"
+  },
+  "nodeGroups": [],
+  "id": "YuZaRI8Rm5C6tuGY",
+  "tags": []
+}
