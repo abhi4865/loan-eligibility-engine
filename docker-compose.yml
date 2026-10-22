@@ -1,0 +1,131 @@
+# docker-compose.yml
+# Starts everything we need on your own computer:
+#   1. postgres  - the database (stands in for Amazon RDS)
+#   2. n8n       - the workflow tool (runs workflows A, B and C)
+#   3. minio     - a fake S3 bucket (stands in for Amazon S3)
+#   4. minio-init - a tiny helper that creates the bucket once, then stops
+#
+# All passwords and names come from the .env file, so nothing secret is in here.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Postgres database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: loan_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      # left side = port on your computer, right side = port inside the container
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # keeps the data safe when the container is stopped or deleted
+      - pgdata:/var/lib/postgresql/data
+      # Postgres runs every file in this folder ONE time, when the database is
+      # created for the first time. The numbers make sure the schema runs first.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/seed_products.sql:/docker-entrypoint-initdb.d/02_seed_products.sql:ro
+    healthcheck:
+      # other services wait until this check passes
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # n8n workflow engine
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: loan_n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5678:5678"
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      # the public address n8n shows for webhook URLs
+      WEBHOOK_URL: http://localhost:5678/
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+      # needed because we use plain http on localhost (no https)
+      N8N_SECURE_COOKIE: "false"
+      # n8n uses this key to encrypt the credentials you save inside it
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # lets workflow expressions read the values below with $env.NAME
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      # values our workflows will read later (phases 3 to 5)
+      N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET}
+      MAX_DEMO_EMAILS: ${MAX_DEMO_EMAILS:-5}
+      TEST_EMAIL_1: ${TEST_EMAIL_1}
+      TEST_EMAIL_2: ${TEST_EMAIL_2}
+      SES_SENDER_EMAIL: ${SES_SENDER_EMAIL}
+    extra_hosts:
+      # lets n8n reach programs running on your computer (like local Lambdas)
+      # using the name host.docker.internal, on Linux as well as Windows and Mac
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # keeps your workflows and saved credentials after a restart
+      - n8n_data:/home/node/.n8n
+
+  # ---------------------------------------------------------------------------
+  # MinIO: a local S3-compatible storage
+  # ---------------------------------------------------------------------------
+  minio:
+    image: loan-minio:local
+    build:
+      context: .
+      dockerfile: docker/minio/Dockerfile
+    container_name: loan_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # the S3 API (used by boto3 and the browser upload)
+      - "9001:9001"   # the web console (you open this in a browser)
+    volumes:
+      - minio_data:/data
+
+  # ---------------------------------------------------------------------------
+  # One-time helper: creates the bucket, then exits
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: loan-minio:local
+    depends_on:
+      - minio
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET}
+    # $$ is how we write a single $ here, so the shell inside the container
+    # (not Docker Compose) reads the variable.
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do
+        echo 'waiting for minio...'; sleep 1;
+      done;
+      mc mb --ignore-existing local/$${S3_BUCKET};
+      echo 'bucket ready';
+      exit 0;
+      "
+
+# Named volumes: Docker keeps these on disk even if the containers are removed.
+volumes:
+  pgdata:
+  n8n_data:
+  minio_data:
+
+

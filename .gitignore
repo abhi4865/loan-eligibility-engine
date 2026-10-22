@@ -1,0 +1,17 @@
+# Secrets: never commit the real environment file
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Serverless Framework and Node
+.serverless/
+node_modules/
+
+# Local build and OS files
+*.zip
+.DS_Store
+Thumbs.db
