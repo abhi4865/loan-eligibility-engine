@@ -1,0 +1,128 @@
+<!-- ui/index.html : one-page uploader. Gets a presigned URL, PUTs the CSV straight to S3/MinIO, shows status -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loan Eligibility Engine - Upload</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#5d6b7c; --line:#d5dae1; --accent:#1f5fd6; --ok:#17803d; --bad:#b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12161c; --card:#1b212a; --text:#e8ecf1; --muted:#9aa7b6; --line:#2f3844; --accent:#6ea2ff; --ok:#4cc27a; --bad:#ff7a70; } }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; display:flex; justify-content:center; padding:32px 16px; }
+  main { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px; width:100%; max-width:560px; }
+  h1 { font-size:1.3rem; margin:0 0 4px; } p.sub { color:var(--muted); margin:0 0 20px; }
+  input[type=file], input[type=text] { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; }
+  button { margin-top:14px; padding:10px 18px; border:0; border-radius:8px; background:var(--accent); color:#fff; font-size:1rem; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  progress { width:100%; margin-top:14px; } details { margin-top:16px; color:var(--muted); } label { display:block; margin-top:10px; }
+  ul { padding-left:20px; } li.ok { color:var(--ok); } li.err { color:var(--bad); font-weight:600; }
+  #status { font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Upload users CSV</h1>
+  <p class="sub">The file goes straight to storage. The pipeline starts by itself.</p>
+
+  <input type="file" id="file" accept=".csv,text/csv" aria-label="Choose a CSV file">
+  <button id="go" type="button">Upload</button>
+  <progress id="bar" value="0" max="1" hidden></progress>
+  <ul id="log" aria-live="polite"></ul>
+  <p id="status"></p>
+
+  <details>
+    <summary>Settings</summary>
+    <label>API URL (presign endpoint base)
+      <input type="text" id="api" value="">
+    </label>
+    <label><input type="checkbox" id="local"> Local mode: ask the local server to run the parser after the upload</label>
+  </details>
+</main>
+
+<script>
+  // Same origin by default (scripts/local_server.py serves this page). For AWS, put the API Gateway URL in Settings.
+  const DEFAULT_API = location.protocol.startsWith('http') ? location.origin : 'http://localhost:8000';
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  $('api').value = DEFAULT_API;
+  $('local').checked = /localhost|127\.0\.0\.1/.test(DEFAULT_API);
+
+  // Adds one line to the progress list. Uses textContent so nothing from the network is run as HTML.
+  function say(text, cls) {
+    const li = document.createElement('li');
+    li.textContent = text;
+    if (cls) li.className = cls;
+    $('log').appendChild(li);
+  }
+  const apiBase = () => $('api').value.trim().replace(/\/+$/, '');
+
+  // Calls an endpoint and returns its JSON. Throws a short error message when the call fails.
+  async function getJson(url, options) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
+    if (!res.ok) throw new Error((data && (data.error || data.message)) || 'HTTP ' + res.status);
+    return data;
+  }
+
+  // Sends the file straight to the presigned URL. XMLHttpRequest is used because it reports upload progress.
+  // The Content-Type must be exactly text/csv, because the URL was signed with it.
+  function putFile(url, file) {
+    return new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open('PUT', url);
+      x.setRequestHeader('Content-Type', 'text/csv');
+      x.upload.onprogress = e => { if (e.lengthComputable) $('bar').value = e.loaded / e.total; };
+      x.onload = () => (x.status >= 200 && x.status < 300) ? resolve() : reject(new Error('Storage answered HTTP ' + x.status));
+      x.onerror = () => reject(new Error('Upload failed (network or CORS problem). See instruction6.md'));
+      x.send(file);
+    });
+  }
+
+  // Asks for the batch status every 2 seconds (up to 2 minutes). If there is no status endpoint, it says so and stops.
+  async function pollStatus(batchId) {
+    for (let i = 0; i < 60; i++) {
+      await sleep(2000);
+      let d;
+      try { d = await getJson(apiBase() + '/status?batch_id=' + encodeURIComponent(batchId)); }
+      catch (e) { say('No status endpoint. Watch the n8n Executions page instead.'); return; }
+      $('status').textContent = 'Status: ' + d.status + (d.total_rows ? ' (rows ' + d.total_rows + ', valid ' + d.valid_rows + ', invalid ' + d.invalid_rows + ')' : '');
+      if (d.error) say('Error: ' + d.error, 'err');
+      if (['processed', 'failed', 'skipped'].includes(d.status)) return;
+    }
+    say('Still processing after 2 minutes. Check n8n.');
+  }
+
+  $('go').addEventListener('click', async () => {
+    const file = $('file').files[0];
+    $('log').textContent = ''; $('status').textContent = '';
+    if (!file) return say('Please choose a CSV file first.', 'err');
+    if (!file.name.toLowerCase().endsWith('.csv')) return say('Only .csv files are accepted.', 'err');
+
+    $('go').disabled = true; $('bar').hidden = false; $('bar').value = 0;
+    try {
+      say('1. Asking for an upload link...');
+      const p = await getJson(apiBase() + '/presign?filename=' + encodeURIComponent(file.name));
+      say('Got link. Batch id: ' + p.batch_id, 'ok');
+
+      say('2. Uploading ' + file.name + ' (' + Math.round(file.size / 1024) + ' KB) directly to storage...');
+      await putFile(p.upload_url, file);
+      say('Uploaded, batch id: ' + p.batch_id, 'ok');
+
+      if ($('local').checked) {
+        say('3. Local mode: starting the parser...');
+        await getJson(apiBase() + '/process?batch_id=' + encodeURIComponent(p.batch_id), { method: 'POST' });
+      } else {
+        say('3. Storage will start the parser by itself (S3 event).');
+      }
+      await pollStatus(p.batch_id);
+    } catch (e) {
+      say(e.message, 'err');
+    } finally {
+      $('go').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

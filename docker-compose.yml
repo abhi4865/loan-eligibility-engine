@@ -95,6 +95,8 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # MinIO's S3 API must accept browser PUT requests from the Phase 6 page.
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_API_CORS_ALLOW_ORIGIN:-*}
     ports:
       - "9000:9000"   # the S3 API (used by boto3 and the browser upload)
       - "9001:9001"   # the web console (you open this in a browser)

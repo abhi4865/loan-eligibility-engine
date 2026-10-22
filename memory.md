@@ -5,7 +5,8 @@
 - Phase 2 — Ingestion (presign + parser): DONE (2026-10-22)
 - Phase 3 — Workflow A: crawler: DONE (2026-10-22)
 - Phase 4 — Workflow B: matching and the Treasure Hunt: DONE (2026-10-22)
-- Phase 5 — Workflow C: notifications: NEXT
+- Phase 5 — Workflow C: notifications: IMPLEMENTED; live email acceptance not verified
+- Phase 6 — Minimal UI: IMPLEMENTED; synthetic browser-to-pipeline smoke test passed
 
 ## Current environment
 - Local Postgres, n8n, and MinIO run with Docker Compose.
@@ -57,4 +58,14 @@
 - Wrong secret returned 401; valid secret returned 202. Two valid runs finished with 104,294 matches and no duplicate pairs.
 - Borderline candidate count was 40,986. No `LLM_API_KEY`/`LLM_MODEL` is configured, so the workflow safely skipped LLM requests and kept undecided borderline pairs matched. `docs/treasure_hunt.md` records the actual funnel and this limitation.
 - Compose passes optional `LLM_API_KEY` and `LLM_MODEL` to n8n; with no key, the workflow records zero calls. `Trigger Workflow C` continues on error until Phase 5 creates its webhook.
-- NEXT: Phase 5 — Workflow C (user notifications).
+- The user later configured an LLM key in `.env`; n8n was recreated and confirmed to see both `LLM_API_KEY` and `LLM_MODEL` without printing their values.
+- NEXT: Phase 6 — Minimal UI (browser upload).
+
+## Phase 6 — Minimal UI
+- `ui/index.html` implements a one-page CSV upload: GET `/presign`, PUT directly to MinIO with `Content-Type: text/csv`, POST `/process` in local mode, then poll `/status`.
+- `scripts/local_server.py` serves the UI and routes, loads `.env` from the repo root, invokes the existing Lambda handlers locally, and binds only to `127.0.0.1`. It uses the batch's stored S3 key (so any sanitized CSV filename works) and refuses processing for missing or already-processing batches.
+- `scripts/set_bucket_cors.py` sets S3 bucket CORS for an explicit origin; default is `http://localhost:8000`. Compose passes `MINIO_API_CORS_ALLOW_ORIGIN` to MinIO, defaulting to `*` for local demo use.
+- README has local run instructions. Verified Python files compile, the local page serves HTTP 200, and MinIO returns an OPTIONS preflight response allowing PUT from `http://localhost:8000`.
+- Synthetic one-row browser smoke test: upload batch `1d95f481-33f9-4b67-b91f-6e77d40ab229` processed as 1 total / 1 valid / 0 invalid. Workflow B and C n8n executions both succeeded. Funnel was all_pairs=30, after_sql=1, after_rules=0, final=0, llm_calls=0; no email was eligible to send. The test user's DB records, uploaded object, and local CSV were removed after verification.
+- Full `data/users.csv` has not yet been submitted through the browser UI. That would exercise real profile matching and configured external LLM/SES integrations; only proceed when the user requests that live data run.
+- Explain-it: CORS allows browser cross-origin access to the storage origin; the browser PUT bypasses Lambda so the CSV payload is not routed through API Gateway/Lambda.
