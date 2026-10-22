@@ -1,0 +1,382 @@
+{
+  "name": "C - User Notification",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "matching-complete",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Matching complete webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        240
+      ],
+      "webhookId": "8c934673-9ab3-4a55-a63f-1d57ad84bb16",
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000001"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "secret-ok",
+              "leftValue": "={{ !!$env.N8N_WEBHOOK_SECRET && $json.headers['x-webhook-secret'] === $env.N8N_WEBHOOK_SECRET }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Check webhook secret",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        220,
+        240
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000002"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"error\":\"unauthorized\"}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "name": "Reject unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        400
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000003"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $('Matching complete webhook').first().json.body || {};\nconst batchId = String(body.batch_id || '');\nif (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(batchId)) throw new Error('batch_id is missing or is not a UUID');\nconst max = Math.max(0, Math.min(100, Number.parseInt($env.MAX_DEMO_EMAILS || '5', 10) || 5));\nconst aliases = [String($env.TEST_EMAIL_1 || '').trim(), String($env.TEST_EMAIL_2 || '').trim()];\nconst sender = String($env.SES_SENDER_EMAIL || '').trim();\nif (!sender || !aliases.every(x => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(x)) || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(sender)) throw new Error('Configure SES_SENDER_EMAIL and both TEST_EMAIL_* values as valid addresses before sending');\nreturn [{json:{batch_id:batchId,max_emails:max,test_emails:aliases,sender_email:sender}}];"
+      },
+      "name": "Validate batch and demo settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        160
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000004"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH picked AS (\n  SELECT m.user_id, u.name, p.product_name, p.provider, p.interest_rate, m.product_id,\n         row_number() OVER (PARTITION BY m.user_id ORDER BY p.provider, p.product_name, m.product_id) AS product_rank\n  FROM matches m\n  JOIN users u ON u.user_id = m.user_id\n  JOIN loan_products p ON p.product_id = m.product_id\n  WHERE m.batch_id = $1::uuid AND m.notified = false\n), selected AS (\n  SELECT * FROM picked WHERE product_rank <= 5\n), per_user AS (\n  SELECT user_id, max(name) AS name, jsonb_agg(jsonb_build_object('product_name',product_name,'provider',provider,'interest_rate',interest_rate) ORDER BY provider,product_name) AS products\n  FROM selected GROUP BY user_id ORDER BY user_id LIMIT $2::int\n)\nSELECT user_id, name, products, row_number() OVER (ORDER BY user_id) AS recipient_number\nFROM per_user ORDER BY user_id",
+        "options": {
+          "queryReplacement": "={{ $('Validate batch and demo settings').first().json.batch_id }},{{ $('Validate batch and demo settings').first().json.max_emails }}"
+        }
+      },
+      "name": "Select capped users and products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        160
+      ],
+      "alwaysOutputData": true,
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000005",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Validate batch and demo settings').first().json;\nconst esc = v => String(v ?? '').replace(/[&<>\\\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));\nconst rows = $input.all().filter(i => i.json.user_id);\nif (!rows.length) return [{json:{dummy:true,batch_id:cfg.batch_id}}];\nreturn rows.map(item => {\n const r=item.json, products=Array.isArray(r.products)?r.products:JSON.parse(r.products||'[]');\n const to=cfg.test_emails[(Number(r.recipient_number)-1)%cfg.test_emails.length];\n const greeting=r.name?`Hi ${esc(r.name)}`:'Hi there';\n const list=products.map(p=>`<li><strong>${esc(p.product_name)}</strong> — ${esc(p.provider)}${p.interest_rate===null?'':` — ${esc(p.interest_rate)}% p.a.`}</li>`).join('');\n const html=`<p>${greeting},</p><p>Here are loan products that may match your profile:</p><ul>${list}</ul><p>Rates and eligibility are subject to lender confirmation.</p>`;\n return {json:{user_id:r.user_id,batch_id:cfg.batch_id,to,from:cfg.sender_email,subject:'Loan products that may fit your profile',html}};\n});"
+      },
+      "name": "Build test notification emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        160
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000006"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "no-emails",
+              "leftValue": "={{ $json.dummy === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Any emails to send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        160
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000007"
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": [
+          "={{ $json.to }}"
+        ],
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "isBodyHtml": true,
+        "additionalFields": {}
+      },
+      "name": "Send via SES",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1380,
+        240
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000008",
+      "credentials": {
+        "aws": {
+          "id": "",
+          "name": "AWS account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE matches SET notified = true WHERE batch_id = $1::uuid AND user_id = $2 AND notified = false RETURNING user_id",
+        "options": {
+          "queryReplacement": "={{ $('Build test notification emails').item.json.batch_id }},{{ $('Build test notification emails').item.json.user_id }}"
+        }
+      },
+      "name": "Mark emailed user notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1620,
+        240
+      ],
+      "alwaysOutputData": true,
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000009",
+      "credentials": {
+        "postgres": {
+          "id": "k5WRDqC6MeG2K79e",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({status:'completed',batch_id:$('Validate batch and demo settings').first().json.batch_id}) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Done",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1380,
+        0
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000010"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({status:'completed',user_id:$('Build test notification emails').item.json.user_id}) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Email sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1840,
+        240
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000011"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"error\":\"email delivery failed; matches were not marked notified\"}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "name": "Report email failure",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1620,
+        440
+      ],
+      "id": "c001a26b-b893-4d4d-b6a9-8385d1000012"
+    }
+  ],
+  "connections": {
+    "Matching complete webhook": {
+      "main": [
+        [
+          {
+            "node": "Check webhook secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check webhook secret": {
+      "main": [
+        [
+          {
+            "node": "Validate batch and demo settings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate batch and demo settings": {
+      "main": [
+        [
+          {
+            "node": "Select capped users and products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select capped users and products": {
+      "main": [
+        [
+          {
+            "node": "Build test notification emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build test notification emails": {
+      "main": [
+        [
+          {
+            "node": "Any emails to send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any emails to send?": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send via SES",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via SES": {
+      "main": [
+        [
+          {
+            "node": "Mark emailed user notified",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Report email failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark emailed user notified": {
+      "main": [
+        [
+          {
+            "node": "Email sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "versionId": "c001a26b-b893-4d4d-b6a9-8385d1000013",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
