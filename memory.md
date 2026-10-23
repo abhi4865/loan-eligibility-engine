@@ -7,6 +7,8 @@
 - Phase 4 — Workflow B: matching and the Treasure Hunt: DONE (2026-10-22)
 - Phase 5 — Workflow C: notifications: IMPLEMENTED; live email acceptance not verified
 - Phase 6 — Minimal UI: IMPLEMENTED; synthetic browser-to-pipeline smoke test passed
+- Phase 7 — AWS deployment configuration: DONE (2026-10-22; package succeeded; deploy not run)
+- Phase 8 — Documentation: NEXT
 
 ## Current environment
 - Local Postgres, n8n, and MinIO run with Docker Compose.
@@ -69,3 +71,17 @@
 - Synthetic one-row browser smoke test: upload batch `1d95f481-33f9-4b67-b91f-6e77d40ab229` processed as 1 total / 1 valid / 0 invalid. Workflow B and C n8n executions both succeeded. Funnel was all_pairs=30, after_sql=1, after_rules=0, final=0, llm_calls=0; no email was eligible to send. The test user's DB records, uploaded object, and local CSV were removed after verification.
 - Full `data/users.csv` has not yet been submitted through the browser UI. That would exercise real profile matching and configured external LLM/SES integrations; only proceed when the user requests that live data run.
 - Explain-it: CORS allows browser cross-origin access to the storage origin; the browser PUT bypasses Lambda so the CSV payload is not routed through API Gateway/Lambda.
+
+## Phase 7 — AWS deployment configuration
+- `serverless.yml` configures Python 3.11 `presign` and `parser` Lambdas, an HTTP API route, a private S3 bucket with browser CORS, and `uploads/` object-created events to the parser. The handler entry points match the existing `handler` functions.
+- IAM grants S3 object read/write under `uploads/` and SES send actions. Lambda uses its execution role for AWS credentials. Optional VPC settings support private RDS connectivity; private-subnet egress to n8n must be provided separately.
+- `requirements-lambda.txt`, `package.json`, and `package-lock.json` add reproducible Lambda and Serverless packaging dependencies. The `psycopg2-binary` Linux wheel is cross-installed for Python 3.11 x86_64 without Docker.
+- `npm run package` succeeded and created `.serverless/loan-eligibility-engine.zip`. On this Windows host, Node cannot scan `.pytest_cache`, so packaging was run from a clean temporary staging copy and the generated artifacts landed in `.serverless/`.
+- RDS is not provisioned by this stack. `README.md` documents creating PostgreSQL separately, applying the schema/seed, configuring Lambda connectivity, and the required VPC/security-group routing. No AWS deploy was run.
+- `.env.example` lists AWS-specific settings. `AWS_S3_BUCKET` must be set to a globally unique name before deploying; `AWS_UI_ORIGIN` should be restricted to the hosted UI origin. AWS database and webhook settings use separate `AWS_*` variables so local `.env` values are not bundled into AWS artifacts; use SSM/Secrets Manager for production secrets.
+
+## Credential rotation — 2026-10-22
+- Rotated the local PostgreSQL password, MinIO root/S3 secret, and `N8N_WEBHOOK_SECRET` after accidental exposure in diagnostic output. Secret values are stored only in ignored `.env`; never copy them into project notes or chat.
+- Updated the saved n8n PostgreSQL credential in place, preserving its credential ID and saved workflow references. PostgreSQL and MinIO connectivity and n8n health were verified after restart.
+- Preserved `N8N_ENCRYPTION_KEY` because n8n saved credentials depend on it; changing it without a supported credential migration could make them unreadable.
+- The user is rotating `LLM_API_KEY` separately. After updating that value in `.env`, restart n8n so it loads the replacement.

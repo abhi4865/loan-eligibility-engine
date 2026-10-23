@@ -1,0 +1,14 @@
+{
+  "name": "loan-eligibility-engine",
+  "private": true,
+  "description": "Deployment tooling for the Python AWS Lambdas.",
+  "scripts": {
+    "package": "serverless package",
+    "deploy": "serverless deploy",
+    "remove": "serverless remove"
+  },
+  "devDependencies": {
+    "serverless": "^3.40.0",
+    "serverless-python-requirements": "^6.1.1"
+  }
+}

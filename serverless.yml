@@ -1,0 +1,142 @@
+service: loan-eligibility-engine
+frameworkVersion: '3'
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: ${env:AWS_REGION, 'ap-south-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 15
+  httpApi:
+    cors:
+      allowedOrigins:
+        - ${env:AWS_UI_ORIGIN, '*'}
+      allowedMethods:
+        - GET
+        - OPTIONS
+      allowedHeaders:
+        - Content-Type
+  environment:
+    POSTGRES_HOST: ${env:AWS_POSTGRES_HOST, ''}
+    POSTGRES_PORT: ${env:AWS_POSTGRES_PORT, '5432'}
+    POSTGRES_DB: ${env:AWS_POSTGRES_DB, ''}
+    POSTGRES_USER: ${env:AWS_POSTGRES_USER, ''}
+    POSTGRES_PASSWORD: ${env:AWS_POSTGRES_PASSWORD, ''}
+    S3_BUCKET: ${self:custom.bucketName}
+    AWS_REGION: ${self:provider.region}
+    S3_ENDPOINT_URL: ''
+    N8N_WEBHOOK_URL: ${env:AWS_N8N_WEBHOOK_URL, ''}
+    N8N_WEBHOOK_SECRET: ${env:AWS_N8N_WEBHOOK_SECRET, ''}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+          Resource: arn:aws:s3:::${self:custom.bucketName}/uploads/*
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource: arn:aws:ses:${self:provider.region}:${env:AWS_ACCOUNT_ID, '*'}:identity/*
+  vpc: ${self:custom.vpc.${env:USE_VPC, 'off'}}
+
+custom:
+  bucketName: ${env:AWS_S3_BUCKET, 'loan-eligibility-engine-${self:provider.region}-${self:provider.stage}-change-me'}
+  vpc:
+    off:
+      securityGroupIds: []
+      subnetIds: []
+    on:
+      securityGroupIds:
+        - ${env:VPC_SECURITY_GROUP_ID, ''}
+      subnetIds:
+        - ${env:VPC_SUBNET_ID_1, ''}
+        - ${env:VPC_SUBNET_ID_2, ''}
+  pythonRequirements:
+    fileName: requirements-lambda.txt
+    dockerizePip: false
+    pipCmdExtraArgs:
+      - '--platform manylinux2014_x86_64'
+      - '--only-binary=:all:'
+      - '--implementation cp'
+      - '--python-version 3.11'
+      - '--abi cp311'
+    slim: true
+
+plugins:
+  - serverless-python-requirements
+
+package:
+  patterns:
+    - '!**'
+    - 'lambdas/**'
+    - '!lambdas/**/__pycache__/**'
+    - '!lambdas/**/*.pyc'
+
+functions:
+  presign:
+    handler: lambdas.presign.handler.handler
+    description: Creates an upload batch and presigned S3 PUT URL
+    events:
+      - httpApi:
+          path: /presign
+          method: GET
+  parser:
+    handler: lambdas.parser.handler.handler
+    description: Streams uploaded CSVs into PostgreSQL and notifies n8n
+    timeout: 300
+    memorySize: 512
+
+resources:
+  Resources:
+    ParserS3Permission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt ParserLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: s3.amazonaws.com
+        SourceAccount: !Ref AWS::AccountId
+        SourceArn: arn:aws:s3:::${self:custom.bucketName}
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn:
+        - ParserS3Permission
+      Properties:
+        BucketName: ${self:custom.bucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - ${env:AWS_UI_ORIGIN, '*'}
+              AllowedMethods:
+                - PUT
+                - GET
+                - HEAD
+              AllowedHeaders:
+                - '*'
+              ExposedHeaders:
+                - ETag
+              MaxAge: 3000
+        NotificationConfiguration:
+          LambdaConfigurations:
+            - Event: s3:ObjectCreated:*
+              Function: !GetAtt ParserLambdaFunction.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: uploads/
+  Outputs:
+    PresignUrl:
+      Description: Set this API base URL in the upload page
+      Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+    UploadBucketName:
+      Value: !Ref UploadBucket
