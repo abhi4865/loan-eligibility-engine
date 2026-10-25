@@ -1,5 +1,7 @@
 # Secrets: never commit the real environment file
 .env
+.env.*
+!.env.example
 .phase6-rotation.json
 .credential-rotation-*.json
 

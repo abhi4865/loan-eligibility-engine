@@ -1,7 +1,7 @@
 {
   "name": "loan-eligibility-engine",
   "private": true,
-  "description": "Deployment tooling for the Python AWS Lambdas.",
+  "description": "Deploy tooling only (Serverless Framework v3). The app itself is Python.",
   "scripts": {
     "package": "serverless package",
     "deploy": "serverless deploy",
