@@ -20,3 +20,8 @@ node_modules/
 *.zip
 .DS_Store
 Thumbs.db
+instruction7.md
+memory.md
+project.md
+docs/architecture.md
+docs/treasure_hunt.md
