@@ -25,3 +25,8 @@ memory.md
 project.md
 docs/architecture.md
 docs/treasure_hunt.md
+
+# Ignore all Markdown except README
+*.md
+!README.md
+docs/*.md
